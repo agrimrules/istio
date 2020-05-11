@@ -90,6 +90,7 @@ var (
 	podNamespaceVar      = env.RegisterStringVar("POD_NAMESPACE", "", "")
 	istioNamespaceVar    = env.RegisterStringVar("ISTIO_NAMESPACE", "", "")
 	kubeAppProberNameVar = env.RegisterStringVar(status.KubeAppProberEnvName, "", "")
+	clusterIDVar         = env.RegisterStringVar("ISTIO_META_CLUSTER_ID", "", "")
 
 	pilotCertProvider = env.RegisterStringVar("PILOT_CERT_PROVIDER", "istiod",
 		"the provider of Pilot DNS certificate.").Get()
@@ -98,7 +99,11 @@ var (
 	outputKeyCertToDir = env.RegisterStringVar("OUTPUT_CERTS", "",
 		"The output directory for the key and certificate. If empty, key and certificate will not be saved. "+
 			"Must be set for VMs using provisioning certificates.").Get()
-	meshConfig = env.RegisterStringVar("MESH_CONFIG", "", "The mesh configuration").Get()
+	proxyConfigEnv = env.RegisterStringVar(
+		"PROXY_CONFIG",
+		"",
+		"The proxy configuration. This will be set by the injection - gateways will use file mounts.",
+	).Get()
 
 	rootCmd = &cobra.Command{
 		Use:          "pilot-agent",
@@ -205,9 +210,8 @@ var (
 			} else {
 				log.Info("Using existing certs")
 			}
-
 			sa := istio_agent.NewSDSAgent(proxyConfig.DiscoveryAddress, proxyConfig.ControlPlaneAuthPolicy == meshconfig.AuthenticationPolicy_MUTUAL_TLS,
-				pilotCertProvider, jwtPath, outputKeyCertToDir)
+				pilotCertProvider, jwtPath, outputKeyCertToDir, clusterIDVar.Get())
 
 			// Connection to Istiod secure port
 			if sa.RequireCerts {
@@ -355,8 +359,8 @@ func setSpiffeTrustDomain(podNamespace string, domain string) {
 	pilotTrustDomain := trustDomain
 	if len(pilotTrustDomain) == 0 {
 		if registryID == serviceregistry.Kubernetes &&
-			(domain == podNamespace+".svc.cluster.local" || domain == "") {
-			pilotTrustDomain = "cluster.local"
+			(domain == podNamespace+".svc."+constants.DefaultKubernetesDomain || domain == "") {
+			pilotTrustDomain = constants.DefaultKubernetesDomain
 		} else if registryID == serviceregistry.Consul &&
 			(domain == "service.consul" || domain == "") {
 			pilotTrustDomain = ""
@@ -381,7 +385,7 @@ func getSAN(ns string, defaultSA string, overrideIdentity string) []string {
 func getDNSDomain(podNamespace, domain string) string {
 	if len(domain) == 0 {
 		if registryID == serviceregistry.Kubernetes {
-			domain = podNamespace + ".svc.cluster.local"
+			domain = podNamespace + ".svc." + constants.DefaultKubernetesDomain
 		} else if registryID == serviceregistry.Consul {
 			domain = "service.consul"
 		} else {
@@ -421,7 +425,8 @@ func init() {
 		"The identity used as the suffix for mixer's spiffe SAN. This would only be used by pilot all other proxy would get this value from pilot")
 
 	proxyCmd.PersistentFlags().StringVar(&meshConfigFile, "meshConfig", "./etc/istio/config/mesh",
-		"File name for Istio mesh configuration. If not specified, a default mesh will be used. MESH_CONFIG environment variable takes precedence.")
+		"File name for Istio mesh configuration. If not specified, a default mesh will be used. This may be overridden by "+
+			"PROXY_CONFIG environment variable or proxy.istio.io/config annotation.")
 	proxyCmd.PersistentFlags().IntVar(&stsPort, "stsPort", 0,
 		"HTTP Port on which to serve Security Token Service (STS). If zero, STS service will not be provided.")
 	proxyCmd.PersistentFlags().StringVar(&tokenManagerPlugin, "tokenManagerPlugin", tokenmanager.GoogleTokenExchange,

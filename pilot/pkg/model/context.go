@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	gogojsonpb "github.com/gogo/protobuf/jsonpb"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/ptypes/any"
@@ -34,12 +34,10 @@ import (
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/pkg/monitoring"
 
+	"istio.io/istio/pkg/config/constants"
+	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/mesh"
-)
-
-const (
-	defaultDomainSuffix = "cluster.local"
 )
 
 var _ mesh.Holder = &Environment{}
@@ -79,7 +77,7 @@ func (e *Environment) GetDomainSuffix() string {
 	if len(e.DomainSuffix) > 0 {
 		return e.DomainSuffix
 	}
-	return defaultDomainSuffix
+	return constants.DefaultKubernetesDomain
 }
 
 func (e *Environment) Mesh() *meshconfig.MeshConfig {
@@ -87,6 +85,18 @@ func (e *Environment) Mesh() *meshconfig.MeshConfig {
 		return e.Watcher.Mesh()
 	}
 	return nil
+}
+
+func (e *Environment) GetDiscoveryHost() (host.Name, error) {
+	proxyConfig := mesh.DefaultProxyConfig()
+	if e.Mesh().DefaultConfig != nil {
+		proxyConfig = *e.Mesh().DefaultConfig
+	}
+	hostname, _, err := net.SplitHostPort(proxyConfig.DiscoveryAddress)
+	if err != nil {
+		return "", err
+	}
+	return host.Name(hostname), nil
 }
 
 func (e *Environment) AddMeshHandler(h func()) {
@@ -117,12 +127,16 @@ func (e *Environment) AddMetric(metric monitoring.Metric, key string, proxy *Pro
 // Request is an alias for array of marshaled resources.
 type Resources = []*any.Any
 
+// XdsUpdates include information about the subset of updated resources.
+// See for example EDS incremental updates.
+type XdsUpdates = map[ConfigKey]struct{}
+
 // XdsResourceGenerator creates the response for a typeURL DiscoveryRequest. If no generator is associated
 // with a Proxy, the default (a networking.core.ConfigGenerator instance) will be used.
 // The server may associate a different generator based on client metadata. Different
 // WatchedResources may use same or different Generator.
 type XdsResourceGenerator interface {
-	Generate(proxy *Proxy, push *PushContext, w *WatchedResource) Resources
+	Generate(proxy *Proxy, push *PushContext, w *WatchedResource, updates XdsUpdates) Resources
 }
 
 // Proxy contains information about an specific instance of a proxy (envoy sidecar, gateway,
@@ -152,7 +166,7 @@ type Proxy struct {
 	// Locality is the location of where Envoy proxy runs. This is extracted from
 	// the registry where possible. If the registry doesn't provide a locality for the
 	// proxy it will use the one sent via ADS that can be configured in the Envoy bootstrap
-	Locality *core.Locality
+	Locality *corev3.Locality
 
 	// DNSDomain defines the DNS domain suffix for short hostnames (e.g.
 	// "default.svc.cluster.local")

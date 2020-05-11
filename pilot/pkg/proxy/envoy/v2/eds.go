@@ -15,13 +15,13 @@
 package v2
 
 import (
-	"reflect"
 	"strconv"
 	"sync/atomic"
 	"time"
 
 	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
+	"github.com/golang/protobuf/ptypes/any"
 	"github.com/golang/protobuf/ptypes/wrappers"
 
 	networkingapi "istio.io/api/networking/v1alpha3"
@@ -32,6 +32,7 @@ import (
 	"istio.io/istio/pilot/pkg/networking/util"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
+	"istio.io/istio/pilot/pkg/util/sets"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/protocol"
@@ -144,7 +145,7 @@ func (s *DiscoveryServer) UpdateServiceShards(push *model.PushContext) error {
 			}
 
 			// TODO(nmittler): Should we get the cluster from the endpoints instead? May require organizing endpoints by cluster first.
-			s.edsUpdate(registry.Cluster(), string(svc.Hostname), svc.Attributes.Namespace, endpoints, true)
+			s.edsUpdate(registry.Cluster(), string(svc.Hostname), svc.Attributes.Namespace, endpoints)
 		}
 	}
 
@@ -181,101 +182,94 @@ func (s *DiscoveryServer) edsIncremental(version string, req *model.PushRequest)
 func (s *DiscoveryServer) EDSUpdate(clusterID, serviceName string, namespace string,
 	istioEndpoints []*model.IstioEndpoint) error {
 	inboundEDSUpdates.Increment()
-	s.edsUpdate(clusterID, serviceName, namespace, istioEndpoints, false)
+	// Update the eds data structures and trigger a push.
+	fp := s.edsUpdate(clusterID, serviceName, namespace, istioEndpoints)
+	s.ConfigUpdate(&model.PushRequest{
+		Full: fp,
+		ConfigsUpdated: map[model.ConfigKey]struct{}{{
+			Kind:      model.ServiceEntryKind,
+			Name:      serviceName,
+			Namespace: namespace,
+		}: {}},
+		Reason: []model.TriggerReason{model.EndpointUpdate},
+	})
 	return nil
 }
 
-// edsUpdate updates EDS by clusterID, serviceName, IstioEndpoints,
-// and requests a Full/EDS push.
+// edsUpdate updates EndpointShards data by clusterID, serviceName, IstioEndpoints.
+// It also tracks the changes to ServiceAccounts. It returns whether a full push
+// is needed or incremental push is sufficient.
 func (s *DiscoveryServer) edsUpdate(clusterID, serviceName string, namespace string,
-	istioEndpoints []*model.IstioEndpoint, internal bool) {
-	// edsShardUpdate replaces a subset (shard) of endpoints, as result of an incremental
-	// update. The endpoint updates may be grouped by K8S clusters, other service registries
-	// or by deployment. Multiple updates are debounced, to avoid too frequent pushes.
-	// After debounce, the services are merged and pushed.
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	requireFull := false
-
-	// Should delete the service EndpointShards when endpoints become zero to prevent memory leak,
-	// but we should not do not delete the keys from EndpointShardsByService map - that will trigger
-	// unnecessary full push which can become a real problem if a pod is in crashloop and thus endpoints
-	// flip flopping between 1 and 0.
+	istioEndpoints []*model.IstioEndpoint) bool {
 	if len(istioEndpoints) == 0 {
-		if s.EndpointShardsByService[serviceName][namespace] != nil {
-			s.deleteEndpointShards(clusterID, serviceName, namespace)
-			adsLog.Infof("Incremental push, service %s has no endpoints", serviceName)
-			s.ConfigUpdate(&model.PushRequest{
-				Full: false,
-				ConfigsUpdated: map[model.ConfigKey]struct{}{{
-					Kind:      model.ServiceEntryKind,
-					Name:      serviceName,
-					Namespace: namespace,
-				}: {}},
-				Reason: []model.TriggerReason{model.EndpointUpdate},
-			})
-		}
-		return
+		s.handleEmptyEndpoints(clusterID, serviceName, namespace)
+		return false
 	}
 
-	// Update the data structures for the service.
-	// 1. Find the 'per service' data
-	if _, f := s.EndpointShardsByService[serviceName]; !f {
-		s.EndpointShardsByService[serviceName] = map[string]*EndpointShards{}
-	}
-	ep, f := s.EndpointShardsByService[serviceName][namespace]
-	if !f {
-		// This endpoint is for a service that was not previously loaded.
-		// Return an error to force a full sync, which will also cause the
-		// EndpointsShardsByService to be initialized with all services.
-		ep = &EndpointShards{
-			Shards:          map[string][]*model.IstioEndpoint{},
-			ServiceAccounts: map[string]bool{},
-		}
-		s.EndpointShardsByService[serviceName][namespace] = ep
-		if !internal {
-			adsLog.Infof("Full push, new service %s", serviceName)
-			requireFull = true
-		}
+	fullPush := false
+
+	// Find endpoint shard for this service, if it is available - otherwise create a new one.
+	ep, created := s.getOrCreateEndpointShard(serviceName, namespace)
+
+	// If we create a new endpoint shard, that means we have not seen the service earlier. We should do a full push.
+	if created {
+		adsLog.Infof("Full push, new service %s", serviceName)
+		fullPush = true
 	}
 
-	// 2. Update data for the specific cluster. Each cluster gets independent
-	// updates containing the full list of endpoints for the service in that cluster.
-	serviceAccounts := map[string]bool{}
+	// Check if ServiceAccounts have changed. We should do a full push if they have changed.
+	serviceAccounts := sets.Set{}
 	for _, e := range istioEndpoints {
 		if e.ServiceAccount != "" {
-			serviceAccounts[e.ServiceAccount] = true
-		}
-	}
-
-	if !reflect.DeepEqual(serviceAccounts, ep.ServiceAccounts) {
-		adsLog.Debugf("Updating service accounts now, svc %v, before service account %v, after %v",
-			serviceName, ep.ServiceAccounts, serviceAccounts)
-		if !internal {
-			requireFull = true
-			adsLog.Infof("Full push, service accounts changed, %v", serviceName)
+			serviceAccounts.Insert(e.ServiceAccount)
 		}
 	}
 
 	ep.mutex.Lock()
+	if !serviceAccounts.Equals(ep.ServiceAccounts) {
+		adsLog.Debugf("Updating service accounts now, svc %v, before service account %v, after %v",
+			serviceName, ep.ServiceAccounts, serviceAccounts)
+		adsLog.Infof("Full push, service accounts changed, %v", serviceName)
+		fullPush = true
+	}
 	ep.Shards[clusterID] = istioEndpoints
 	ep.ServiceAccounts = serviceAccounts
 	ep.mutex.Unlock()
 
-	// for internal update: this called by DiscoveryServer.Push --> UpdateServiceShards,
-	// no need to trigger push here.
-	// It is done in DiscoveryServer.Push --> AdsPushAll
-	if !internal {
-		s.ConfigUpdate(&model.PushRequest{
-			Full: requireFull,
-			ConfigsUpdated: map[model.ConfigKey]struct{}{{
-				Kind:      model.ServiceEntryKind,
-				Name:      serviceName,
-				Namespace: namespace,
-			}: {}},
-			Reason: []model.TriggerReason{model.EndpointUpdate},
-		})
+	return fullPush
+}
+
+func (s *DiscoveryServer) handleEmptyEndpoints(clusterID, serviceName, namespace string) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	// Should delete the service EndpointShards when endpoints become zero to prevent memory leak,
+	// but we should not do not delete the keys from EndpointShardsByService map - that will trigger
+	// unnecessary full push which can become a real problem if a pod is in crashloop and thus endpoints
+	// flip flopping between 1 and 0.
+	if s.EndpointShardsByService[serviceName][namespace] != nil {
+		s.deleteEndpointShards(clusterID, serviceName, namespace)
+		adsLog.Infof("Incremental push, service %s has no endpoints", serviceName)
 	}
+}
+
+func (s *DiscoveryServer) getOrCreateEndpointShard(serviceName, namespace string) (*EndpointShards, bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if _, exists := s.EndpointShardsByService[serviceName]; !exists {
+		s.EndpointShardsByService[serviceName] = map[string]*EndpointShards{}
+	}
+	if ep, exists := s.EndpointShardsByService[serviceName][namespace]; exists {
+		return ep, false
+	}
+	// This endpoint is for a service that was not previously loaded.
+	ep := &EndpointShards{
+		Shards:          map[string][]*model.IstioEndpoint{},
+		ServiceAccounts: sets.Set{},
+	}
+	s.EndpointShardsByService[serviceName][namespace] = ep
+
+	return ep, true
 }
 
 // deleteEndpointShards deletes matching endpoint shards from EndpointShardsByService map. This is called when
@@ -314,7 +308,7 @@ func connectionID(node string) string {
 // Initial implementation is computing the endpoints on the flight - caching will be added as needed, based on
 // perf tests. The logic to compute is based on the current UpdateClusterInc
 func (s *DiscoveryServer) loadAssignmentsForClusterIsolated(proxy *model.Proxy, push *model.PushContext,
-	clusterName string) *xdsapi.ClusterLoadAssignment {
+	clusterName string) *endpoint.ClusterLoadAssignment {
 	_, subsetName, hostname, port := model.ParseSubsetKey(clusterName)
 
 	// TODO: BUG. this code is incorrect if 1.1 isolation is used. With destination rule scoping
@@ -366,7 +360,7 @@ func (s *DiscoveryServer) loadAssignmentsForClusterIsolated(proxy *model.Proxy, 
 
 	locEps := buildLocalityLbEndpointsFromShards(proxy, se, svc, svcPort, subsetLabels, clusterName, push)
 
-	return &xdsapi.ClusterLoadAssignment{
+	return &endpoint.ClusterLoadAssignment{
 		ClusterName: clusterName,
 		Endpoints:   locEps,
 	}
@@ -374,7 +368,7 @@ func (s *DiscoveryServer) loadAssignmentsForClusterIsolated(proxy *model.Proxy, 
 
 func (s *DiscoveryServer) generateEndpoints(
 	clusterName string, proxy *model.Proxy, push *model.PushContext, edsUpdatedServices map[string]struct{},
-) *xdsapi.ClusterLoadAssignment {
+) *endpoint.ClusterLoadAssignment {
 	_, _, hostname, _ := model.ParseSubsetKey(clusterName)
 	if edsUpdatedServices != nil {
 		if _, ok := edsUpdatedServices[string(hostname)]; !ok {
@@ -393,7 +387,7 @@ func (s *DiscoveryServer) generateEndpoints(
 	// EDS filter on the endpoints
 	if push.Networks != nil && len(push.Networks.Networks) > 0 {
 		endpoints := EndpointsByNetworkFilter(push, proxy.Metadata.Network, l.Endpoints)
-		filteredCLA := &xdsapi.ClusterLoadAssignment{
+		filteredCLA := &endpoint.ClusterLoadAssignment{
 			ClusterName: l.ClusterName,
 			Endpoints:   endpoints,
 			Policy:      l.Policy,
@@ -415,11 +409,39 @@ func (s *DiscoveryServer) generateEndpoints(
 	return l
 }
 
+// EdsGenerator implements the new Generate method for EDS, using the in-memory, optimized endpoint
+// storage in DiscoveryServer.
+type EdsGenerator struct {
+	Server *DiscoveryServer
+}
+
+func (eds *EdsGenerator) Generate(proxy *model.Proxy, push *model.PushContext, w *model.WatchedResource, updates model.XdsUpdates) model.Resources {
+	resp := []*any.Any{}
+
+	var edsUpdatedServices map[string]struct{} = nil
+	if updates != nil {
+		edsUpdatedServices = model.ConfigNamesOfKind(updates, model.ServiceEntryKind)
+	}
+	// All clusters that this endpoint is watching. For 1.0 - it's typically all clusters in the mesh.
+	// For 1.1+Sidecar - it's the small set of explicitly imported clusters, using the isolated DestinationRules
+	for _, clusterName := range w.ResourceNames {
+		l := eds.Server.generateEndpoints(clusterName, proxy, push, edsUpdatedServices)
+		if l == nil {
+			continue
+		}
+		msg := util.MessageToAny(l)
+		msg.TypeUrl = w.TypeUrl
+		resp = append(resp, msg)
+	}
+
+	return resp
+}
+
 // pushEds is pushing EDS updates for a single connection. Called the first time
 // a client connects, for incremental updates and for full periodic updates.
 func (s *DiscoveryServer) pushEds(push *model.PushContext, con *XdsConnection, version string, edsUpdatedServices map[string]struct{}) error {
 	pushStart := time.Now()
-	loadAssignments := make([]*xdsapi.ClusterLoadAssignment, 0)
+	loadAssignments := make([]*endpoint.ClusterLoadAssignment, 0)
 	endpoints := 0
 	empty := 0
 
@@ -510,7 +532,7 @@ func getOutlierDetectionAndLoadBalancerSettings(push *model.PushContext, proxy *
 	return outlierDetectionEnabled, lbSettings
 }
 
-func endpointDiscoveryResponse(loadAssignments []*xdsapi.ClusterLoadAssignment, version, noncePrefix, typeURL string) *xdsapi.DiscoveryResponse {
+func endpointDiscoveryResponse(loadAssignments []*endpoint.ClusterLoadAssignment, version, noncePrefix, typeURL string) *xdsapi.DiscoveryResponse {
 	out := &xdsapi.DiscoveryResponse{
 		TypeUrl: typeURL,
 		// Pilot does not really care for versioning. It always supplies what's currently
@@ -545,6 +567,7 @@ func buildLocalityLbEndpointsFromShards(
 	isClusterLocal := push.IsClusterLocal(svc)
 
 	shards.mutex.Lock()
+
 	// The shards are updated independently, now need to filter and merge
 	// for this cluster
 	for clusterID, endpoints := range shards.Shards {
@@ -578,6 +601,7 @@ func buildLocalityLbEndpointsFromShards(
 
 		}
 	}
+
 	shards.mutex.Unlock()
 
 	locEps := make([]*endpoint.LocalityLbEndpoints, 0, len(localityEpMap))
@@ -602,8 +626,8 @@ func buildLocalityLbEndpointsFromShards(
 }
 
 // cluster with no endpoints
-func buildEmptyClusterLoadAssignment(clusterName string) *xdsapi.ClusterLoadAssignment {
-	return &xdsapi.ClusterLoadAssignment{
+func buildEmptyClusterLoadAssignment(clusterName string) *endpoint.ClusterLoadAssignment {
+	return &endpoint.ClusterLoadAssignment{
 		ClusterName: clusterName,
 	}
 }

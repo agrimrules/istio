@@ -27,8 +27,9 @@ import (
 	"strings"
 	"testing"
 
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+
 	v1 "github.com/census-instrumentation/opencensus-proto/gen-go/trace/v1"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	v2 "github.com/envoyproxy/go-control-plane/envoy/config/bootstrap/v2"
 	tracev2 "github.com/envoyproxy/go-control-plane/envoy/config/trace/v2"
 	matcher "github.com/envoyproxy/go-control-plane/envoy/type/matcher"
@@ -247,6 +248,9 @@ func TestGolden(t *testing.T) {
 				"sidecar.istio.io/extraStatTags":         "dlp_status,dlp_error",
 			},
 			stats: stats{regexps: "http.[0-9]*\\.[0-9]*\\.[0-9]*\\.[0-9]*_8080.downstream_rq_time"},
+		},
+		{
+			base: "tracing_tls",
 		},
 	}
 
@@ -625,6 +629,6 @@ func (f *fakePlatform) Metadata() map[string]string {
 	return f.meta
 }
 
-func (f *fakePlatform) Locality() *core.Locality {
-	return &core.Locality{}
+func (f *fakePlatform) Locality() *corev3.Locality {
+	return &corev3.Locality{}
 }

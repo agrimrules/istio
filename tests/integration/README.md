@@ -233,9 +233,7 @@ func TestMyLogic(t *testing.T) {
         Run(func(ctx framework.TestContext) {
             // Create the components.
             g := galley.NewOrFail(ctx, ctx, galley.Config{})
-            p := pilot.NewOrFail(ctx, ctx, pilot.Config {
-                Galley: g,
-            })
+            p := pilot.NewOrFail(ctx, ctx, pilot.Config {})
 
             // Apply configuration via Galley.
             g.ApplyConfigOrFail(ctx, nil, mycfg)
@@ -447,7 +445,14 @@ also explicitly specify the native environment:
 $ go test ./... -istio.test.env native
 ```
 
-Note: this may require you to [enable forwarding from Docker containers to the outside world](https://docs.docker.com/network/bridge/#enable-forwarding-from-docker-containers-to-the-outside-world).
+Note: this may require you to [enable forwarding from Docker containers to the outside world](https://docs.docker.com/network/bridge/#enable-forwarding-from-docker-containers-to-the-outside-world):
+
+```bash
+sudo sysctl net.ipv4.conf.all.forwarding=1
+sudo iptables -P FORWARD ACCEPT
+# On some machines, an additional rule may be needed to allow traffic from all `br-...` docker bridge interfaces
+sudo iptables -A INPUT -i br-+ -j ACCEPT
+```
 
 ### Kubernetes Environment
 

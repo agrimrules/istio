@@ -28,23 +28,6 @@ import (
 	"istio.io/istio/operator/pkg/validate"
 )
 
-var (
-	ignoreStdErrList = []string{
-		// TODO: remove when https://github.com/kubernetes/kubernetes/issues/82154 is fixed.
-		"Warning: kubectl apply should be used on resource created by either kubectl create --save-config or kubectl apply",
-	}
-)
-
-func ignoreError(stderr string) bool {
-	trimmedStdErr := strings.TrimSpace(stderr)
-	for _, ignore := range ignoreStdErrList {
-		if strings.HasPrefix(trimmedStdErr, ignore) {
-			return true
-		}
-	}
-	return trimmedStdErr == ""
-}
-
 // yamlFromSetFlags takes a slice of --set flag key-value pairs and returns a YAML tree representation.
 // If force is set, validation errors cause warning messages to be written to logger rather than causing error.
 func yamlFromSetFlags(setOverlay []string, force bool, l clog.Logger) (string, error) {
@@ -105,9 +88,13 @@ func fetchExtractInstallPackageHTTP(releaseTarURL string) (string, error) {
 }
 
 // --charts is an alias for --set installPackagePath=
-func applyInstallFlagAlias(flags []string, charts string) []string {
+// --revision is an alias for --set revision=
+func applyFlagAliases(flags []string, charts, revision string) []string {
 	if charts != "" {
 		flags = append(flags, fmt.Sprintf("installPackagePath=%s", charts))
+	}
+	if revision != "" {
+		flags = append(flags, fmt.Sprintf("revision=%s", revision))
 	}
 	return flags
 }

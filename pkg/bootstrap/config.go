@@ -25,7 +25,7 @@ import (
 	"strings"
 
 	md "cloud.google.com/go/compute/metadata"
-	envoy_api_v2_core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 
 	"istio.io/istio/pkg/config/constants"
 
@@ -207,6 +207,7 @@ var (
 		"destination_cluster",
 		"request_protocol",
 		"request_operation",
+		"request_host",
 		"response_flags",
 		"grpc_response_status",
 		"connection_security_policy",
@@ -280,7 +281,7 @@ func getNodeMetadataOptions(meta *model.NodeMetadata, rawMeta map[string]interfa
 }
 
 func getLocalityOptions(meta *model.NodeMetadata, platEnv platform.Environment) []option.Instance {
-	var l *envoy_api_v2_core.Locality
+	var l *corev3.Locality
 	if meta.Labels[model.LocalityLabel] == "" {
 		l = platEnv.Locality()
 		// The locality string was not set, try to get locality from platform
@@ -304,10 +305,12 @@ func getProxyConfigOptions(config *meshAPI.ProxyConfig, metadata *model.NodeMeta
 
 	// Add tracing options.
 	if config.Tracing != nil {
+		var isH2 bool = false
 		switch tracer := config.Tracing.Tracer.(type) {
 		case *meshAPI.Tracing_Zipkin_:
 			opts = append(opts, option.ZipkinAddress(tracer.Zipkin.Address))
 		case *meshAPI.Tracing_Lightstep_:
+			isH2 = true
 			// Create the token file.
 			lightstepAccessTokenPath := lightstepAccessTokenFile(config.ConfigPath)
 			lsConfigOut, err := os.Create(lightstepAccessTokenPath)
@@ -320,9 +323,7 @@ func getProxyConfigOptions(config *meshAPI.ProxyConfig, metadata *model.NodeMeta
 			}
 
 			opts = append(opts, option.LightstepAddress(tracer.Lightstep.Address),
-				option.LightstepToken(lightstepAccessTokenPath),
-				option.LightstepSecure(tracer.Lightstep.Secure),
-				option.LightstepCACertPath(tracer.Lightstep.CacertPath))
+				option.LightstepToken(lightstepAccessTokenPath))
 		case *meshAPI.Tracing_Datadog_:
 			opts = append(opts, option.DataDogAddress(tracer.Datadog.Address))
 		case *meshAPI.Tracing_Stackdriver_:
@@ -339,6 +340,7 @@ func getProxyConfigOptions(config *meshAPI.ProxyConfig, metadata *model.NodeMeta
 				option.StackDriverMaxAttributes(getInt64ValueOrDefault(tracer.Stackdriver.MaxNumberOfAttributes, 200)),
 				option.StackDriverMaxEvents(getInt64ValueOrDefault(tracer.Stackdriver.MaxNumberOfMessageEvents, 200)))
 		}
+		opts = append(opts, option.TracingTLS(config.Tracing.TlsSettings, metadata, isH2))
 	}
 
 	// Add options for Envoy metrics.

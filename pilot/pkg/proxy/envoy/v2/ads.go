@@ -23,6 +23,8 @@ import (
 
 	xdsapi "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	cluster "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	ads "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -75,7 +77,7 @@ type XdsConnection struct {
 
 	LDSListeners []*xdsapi.Listener                    `json:"-"`
 	RouteConfigs map[string]*xdsapi.RouteConfiguration `json:"-"`
-	CDSClusters  []*xdsapi.Cluster
+	CDSClusters  []*cluster.Cluster
 
 	// Last nonce sent and ack'd (timestamps) used for debugging
 	ClusterNonceSent, ClusterNonceAcked   string
@@ -229,15 +231,21 @@ func (s *DiscoveryServer) StreamAggregatedResources(stream ads.AggregatedDiscove
 			}
 			// This should be only set for the first request. The node id may not be set - for example malicious clients.
 			if con.node == nil {
+				if discReq.Node == nil {
+					return errors.New("missing node ID")
+				}
 				if err := s.initConnection(discReq.Node, con); err != nil {
 					return err
 				}
 				defer s.removeCon(con.ConID)
 			}
+			if s.StatusReporter != nil {
+				s.StatusReporter.RegisterEvent(con.ConID, discReq.TypeUrl, discReq.ResponseNonce)
+			}
 
 			// Based on node metadata a different generator was selected, use it instead of the default
 			// behavior.
-			if con.node.XdsResourceGenerator != nil && discReq.TypeUrl != EndpointType {
+			if con.node.XdsResourceGenerator != nil {
 				// Endpoints are special - will use the optimized code path.
 				err = s.handleCustomGenerator(con, discReq)
 				if err != nil {
@@ -513,7 +521,11 @@ func (s *DiscoveryServer) initProxy(node *core.Node) (*model.Proxy, error) {
 	// This is not preferable as only the connected Pilot is aware of this proxies location, but it
 	// can still help provide some client-side Envoy context when load balancing based on location.
 	if util.IsLocalityEmpty(proxy.Locality) {
-		proxy.Locality = node.Locality
+		proxy.Locality = &corev3.Locality{
+			Region:  node.Locality.GetRegion(),
+			Zone:    node.Locality.GetZone(),
+			SubZone: node.Locality.GetSubZone(),
+		}
 	}
 
 	// Discover supported IP Versions of proxy so that appropriate config can be delivered.
@@ -601,6 +613,14 @@ func (s *DiscoveryServer) pushConnection(con *XdsConnection, pushEv *XdsEvent) e
 		} else {
 			adsLog.Debugf("Skipping push to %v, no updates required", con.ConID)
 		}
+
+		if s.StatusReporter != nil {
+			// this version of the config will never be distributed to this envoy because it is not a relevant diff.
+			// inform distribution status reporter that this connection has been updated, because it effectively has
+			for _, typeURL := range []string{ClusterType, ListenerType, RouteType, EndpointType} {
+				s.StatusReporter.RegisterEvent(con.ConID, typeURL, pushEv.noncePrefix)
+			}
+		}
 		return nil
 	}
 
@@ -615,7 +635,7 @@ func (s *DiscoveryServer) pushConnection(con *XdsConnection, pushEv *XdsEvent) e
 	// returning nil if the push is not needed.
 	if con.node.XdsResourceGenerator != nil {
 		for _, w := range con.node.Active {
-			err := s.pushGeneratorV2(con, pushEv.push, currentVersion, w)
+			err := s.pushGeneratorV2(con, pushEv.push, currentVersion, w, pushEv.configsUpdated)
 			if err != nil {
 				return err
 			}
@@ -629,6 +649,8 @@ func (s *DiscoveryServer) pushConnection(con *XdsConnection, pushEv *XdsEvent) e
 		if err != nil {
 			return err
 		}
+	} else if s.StatusReporter != nil {
+		s.StatusReporter.RegisterEvent(con.ConID, ClusterType, pushEv.noncePrefix)
 	}
 
 	if len(con.Clusters) > 0 && pushTypes[EDS] {
@@ -636,18 +658,24 @@ func (s *DiscoveryServer) pushConnection(con *XdsConnection, pushEv *XdsEvent) e
 		if err != nil {
 			return err
 		}
+	} else if s.StatusReporter != nil {
+		s.StatusReporter.RegisterEvent(con.ConID, EndpointType, pushEv.noncePrefix)
 	}
 	if con.LDSWatch && pushTypes[LDS] {
 		err := s.pushLds(con, pushEv.push, currentVersion)
 		if err != nil {
 			return err
 		}
+	} else if s.StatusReporter != nil {
+		s.StatusReporter.RegisterEvent(con.ConID, ListenerType, pushEv.noncePrefix)
 	}
 	if len(con.Routes) > 0 && pushTypes[RDS] {
 		err := s.pushRoute(con, pushEv.push, currentVersion)
 		if err != nil {
 			return err
 		}
+	} else if s.StatusReporter != nil {
+		s.StatusReporter.RegisterEvent(con.ConID, RouteType, pushEv.noncePrefix)
 	}
 	proxiesConvergeDelay.Record(time.Since(pushEv.start).Seconds())
 	return nil
@@ -765,6 +793,9 @@ func (s *DiscoveryServer) removeCon(conID string) {
 	}
 
 	xdsClients.Record(float64(len(s.adsClients)))
+	if s.StatusReporter != nil {
+		go s.StatusReporter.RegisterDisconnect(conID, []string{ClusterType, ListenerType, RouteType, EndpointType})
+	}
 }
 
 // Send with timeout
@@ -785,8 +816,6 @@ func (conn *XdsConnection) send(res *xdsapi.DiscoveryResponse) error {
 				conn.RouteNonceSent = res.Nonce
 			case EndpointType, v3.EndpointType:
 				conn.EndpointNonceSent = res.Nonce
-			default:
-				adsLog.Warnf("sent unknown XDS type: %v", res.TypeUrl)
 			}
 		}
 		if res.TypeUrl == RouteType || res.TypeUrl == v3.RouteType {

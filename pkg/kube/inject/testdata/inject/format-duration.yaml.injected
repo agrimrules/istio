@@ -73,9 +73,9 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: MESH_CONFIG
+        - name: PROXY_CONFIG
           value: |
-            {"defaultConfig":{"drainDuration":"23s","parentShutdownDuration":"42s"}}
+            {"drainDuration":"23s","parentShutdownDuration":"42s"}
         - name: ISTIO_META_POD_PORTS
           value: |-
             [
@@ -180,6 +180,8 @@ spec:
           runAsGroup: 0
           runAsNonRoot: false
           runAsUser: 0
+      securityContext:
+        fsGroup: 1337
       volumes:
       - emptyDir:
           medium: Memory

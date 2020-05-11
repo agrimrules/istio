@@ -21,6 +21,7 @@ export CLUSTER3_NAME=${CLUSTER3_NAME:-"cluster3"}
 
 export CLUSTER_NAMES=("${CLUSTER1_NAME}" "${CLUSTER2_NAME}" "${CLUSTER3_NAME}")
 export CLUSTER_POD_SUBNETS=(10.10.0.0/16 10.20.0.0/16 10.30.0.0/16)
+export CLUSTER_SVC_SUBNETS=(10.255.10.0/24 10.255.20.0/24 10.255.30.0/24)
 
 function setup_gcloud_credentials() {
   if [[ $(command -v gcloud) ]]; then
@@ -138,7 +139,7 @@ function cleanup_kind_clusters() {
 
 function setup_kind_cluster() {
   IP_FAMILY="${1:-ipv4}"
-  IMAGE="${2:-kindest/node:v1.18.0}"
+  IMAGE="${2:-kindest/node:v1.18.2}"
   NAME="${3:-istio-testing}"
   CONFIG="${4:-}"
   # Delete any previous KinD cluster
@@ -197,13 +198,14 @@ function setup_kind_clusters() {
   for i in "${!CLUSTER_NAMES[@]}"; do
     CLUSTER_NAME="${CLUSTER_NAMES[$i]}"
     CLUSTER_POD_SUBNET="${CLUSTER_POD_SUBNETS[$i]}"
+    CLUSTER_SVC_SUBNET="${CLUSTER_SVC_SUBNETS[$i]}"
     CLUSTER_YAML="${ARTIFACTS}/config-${CLUSTER_NAME}.yaml"
     cat <<EOF > "${CLUSTER_YAML}"
       kind: Cluster
       apiVersion: kind.sigs.k8s.io/v1alpha3
       networking:
         podSubnet: ${CLUSTER_POD_SUBNET}
-        serviceSubnet: 10.255.10.0/24
+        serviceSubnet: ${CLUSTER_SVC_SUBNET}
 EOF
 
     CLUSTER_KUBECONFIG="${KUBECONFIG_DIR}/${CLUSTER_NAME}"
@@ -212,8 +214,16 @@ EOF
     # TODO: add IPv6
     KUBECONFIG="${CLUSTER_KUBECONFIG}" setup_kind_cluster "ipv4" "${IMAGE}" "${CLUSTER_NAME}" "${CLUSTER_YAML}"
 
-    # Replace with --internal which allows cross-cluster api server access
-    kind get kubeconfig --name "${CLUSTER_NAME}" --internal > "${CLUSTER_KUBECONFIG}"
+    # Install MetalLB for LoadBalancer support
+    install_metallb "$CLUSTER_KUBECONFIG"
+
+    # Kind currently supports getting a kubeconfig for internal or external usage. To simplify our tests,
+    # its much simpler if we have a single kubeconfig that can be used internally and externally.
+    # To do this, we can replace the server with the IP address of the docker container
+    # https://github.com/kubernetes-sigs/kind/issues/1558 tracks this upstream
+    CONTAINER_IP=$(docker inspect "${CLUSTER_NAME}-control-plane" --format "{{ .NetworkSettings.Networks.kind.IPAddress }}")
+    kind get kubeconfig --name "${CLUSTER_NAME}" --internal | \
+      sed "s/${CLUSTER_NAME}-control-plane/${CONTAINER_IP}/g" > "${CLUSTER_KUBECONFIG}"
   done
 
   # Export variables for the kube configs for the clusters.
@@ -223,6 +233,7 @@ EOF
   CLUSTER_KUBECONFIGS=("$CLUSTER1_KUBECONFIG" "$CLUSTER2_KUBECONFIG" "$CLUSTER3_KUBECONFIG")
 
   if [[ "${TOPOLOGY}" == "MULTICLUSTER_SINGLE_NETWORK" ]]; then
+
     # Allow direct access between all clusters.
     for i in "${!CLUSTER_NAMES[@]}"; do
       CLUSTERI_NAME="${CLUSTER_NAMES[$i]}"
@@ -250,15 +261,86 @@ function connect_kind_clusters() {
   C2="${3}"
   C2_KUBECONFIG="${4}"
 
-  # Set up routing rules for inter-cluster direct pod to pod communication
+  # Set up routing rules for inter-cluster direct pod to pod & service communication
   C1_NODE="${C1}-control-plane"
   C2_NODE="${C2}-control-plane"
-  C1_DOCKER_IP=$(docker inspect -f "{{ .NetworkSettings.IPAddress }}" "${C1_NODE}")
-  C2_DOCKER_IP=$(docker inspect -f "{{ .NetworkSettings.IPAddress }}" "${C2_NODE}")
+  C1_DOCKER_IP=$(docker inspect -f "{{ .NetworkSettings.Networks.kind.IPAddress }}" "${C1_NODE}")
+  C2_DOCKER_IP=$(docker inspect -f "{{ .NetworkSettings.Networks.kind.IPAddress }}" "${C2_NODE}")
   C1_POD_CIDR=$(KUBECONFIG="${C1_KUBECONFIG}" kubectl get node -ojsonpath='{.items[0].spec.podCIDR}')
   C2_POD_CIDR=$(KUBECONFIG="${C2_KUBECONFIG}" kubectl get node -ojsonpath='{.items[0].spec.podCIDR}')
+  C1_SVC_CIDR=$(KUBECONFIG="${C1_KUBECONFIG}" kubectl cluster-info dump | sed -n 's/^.*--service-cluster-ip-range=\([^"]*\).*$/\1/p' | head -n 1)
+  C2_SVC_CIDR=$(KUBECONFIG="${C2_KUBECONFIG}" kubectl cluster-info dump | sed -n 's/^.*--service-cluster-ip-range=\([^"]*\).*$/\1/p' | head -n 1)
   docker exec "${C1_NODE}" ip route add "${C2_POD_CIDR}" via "${C2_DOCKER_IP}"
+  docker exec "${C1_NODE}" ip route add "${C2_SVC_CIDR}" via "${C2_DOCKER_IP}"
   docker exec "${C2_NODE}" ip route add "${C1_POD_CIDR}" via "${C1_DOCKER_IP}"
+  docker exec "${C2_NODE}" ip route add "${C1_SVC_CIDR}" via "${C1_DOCKER_IP}"
+
+  # Set up routing rules for inter-cluster pod to MetalLB LoadBalancer communication
+  connect_metallb "$C1_NODE" "$C2_KUBECONFIG" "$C2_DOCKER_IP"
+  connect_metallb "$C2_NODE" "$C1_KUBECONFIG" "$C1_DOCKER_IP"
+}
+
+function install_metallb() {
+  KUBECONFIG="${1}"
+  kubectl apply --kubeconfig="$KUBECONFIG" -f https://raw.githubusercontent.com/metallb/metallb/v0.9.3/manifests/namespace.yaml
+  kubectl apply --kubeconfig="$KUBECONFIG" -f https://raw.githubusercontent.com/metallb/metallb/v0.9.3/manifests/metallb.yaml
+  kubectl create --kubeconfig="$KUBECONFIG" secret generic -n metallb-system memberlist --from-literal=secretkey="$(openssl rand -base64 128)"
+
+  if [ -z "${METALLB_IPS[*]}" ]; then
+    # Take IPs from the end of the docker kind network subnet to use for MetalLB IPs
+    DOCKER_KIND_SUBNET="$(docker inspect kind | jq .[0].IPAM.Config[0].Subnet -r)"
+    METALLB_IPS=()
+    while read -r ip; do
+      METALLB_IPS+=("$ip")
+    done < <(cidr_to_ips "$DOCKER_KIND_SUBNET" | tail -n 100)
+  fi
+
+  # Give this cluster of those IPs
+  RANGE="${METALLB_IPS[0]}-${METALLB_IPS[9]}"
+  METALLB_IPS=("${METALLB_IPS[@]:10}")
+
+  echo 'apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: metallb-system
+  name: config
+data:
+  config: |
+    address-pools:
+    - name: default
+      protocol: layer2
+      addresses:
+      - '"$RANGE" | kubectl apply --kubeconfig="$KUBECONFIG" -f -
+}
+
+function connect_metallb() {
+  REMOTE_NODE=$1
+  METALLB_KUBECONFIG=$2
+  METALLB_DOCKER_IP=$3
+
+  IP_REGEX='(([0-9]{1,3}\.?){4})'
+  LB_CONFIG="$(kubectl --kubeconfig="${METALLB_KUBECONFIG}" -n metallb-system get cm config -o jsonpath="{.data.config}")"
+  if [[ "$LB_CONFIG" =~ $IP_REGEX-$IP_REGEX ]]; then
+    while read -r lb_cidr; do
+      docker exec "${REMOTE_NODE}" ip route add "${lb_cidr}" via "${METALLB_DOCKER_IP}"
+    done < <(ips_to_cidrs "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}")
+  fi
+}
+
+function cidr_to_ips() {
+    CIDR="$1"
+    python3 - <<EOF
+from ipaddress import IPv4Network; [print(str(ip)) for ip in IPv4Network('$CIDR').hosts()]
+EOF
+}
+
+function ips_to_cidrs() {
+  IP_RANGE_START="$1"
+  IP_RANGE_END="$2"
+  python3 - <<EOF
+from ipaddress import summarize_address_range, IPv4Address
+[ print(n.compressed) for n in summarize_address_range(IPv4Address(u'$IP_RANGE_START'), IPv4Address(u'$IP_RANGE_END')) ]
+EOF
 }
 
 function cni_run_daemon_kind() {

@@ -17,16 +17,14 @@ package namespace
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
-	"os"
-	"path"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/go-multierror"
 
-	"istio.io/istio/pilot/pkg/model"
+	"istio.io/api/label"
+
 	"istio.io/istio/pkg/test/framework/components/environment/kube"
 	"istio.io/istio/pkg/test/framework/components/istio"
 	"istio.io/istio/pkg/test/framework/resource"
@@ -57,27 +55,7 @@ func (n *kubeNamespace) Dump() {
 	}
 
 	for _, cluster := range n.env.KubeClusters {
-		pods, err := cluster.GetPods(n.name)
-		if err != nil {
-			scopes.CI.Errorf("Unable to get pods from the namespace: %v", err)
-			return
-		}
-
-		for _, pod := range pods {
-			containers := append(pod.Spec.Containers, pod.Spec.InitContainers...)
-			for _, container := range containers {
-				l, err := cluster.Logs(pod.Namespace, pod.Name, container.Name, false /* previousLog */)
-				if err != nil {
-					scopes.CI.Errorf("Unable to get logs for pod/container: %s/%s/%s", pod.Namespace, pod.Name, container.Name)
-					continue
-				}
-
-				fname := path.Join(d, fmt.Sprintf("%s-%s.log", pod.Name, container.Name))
-				if err = ioutil.WriteFile(fname, []byte(l), os.ModePerm); err != nil {
-					scopes.CI.Errorf("Unable to write logs for pod/container: %s/%s/%s", pod.Namespace, pod.Name, container.Name)
-				}
-			}
-		}
+		cluster.DumpPods(d, n.name)
 	}
 }
 
@@ -164,7 +142,7 @@ func createNamespaceLabels(cfg *Config) map[string]string {
 	l := make(map[string]string)
 	if cfg.Inject {
 		if cfg.Revision != "" {
-			l[model.RevisionLabel] = cfg.Revision
+			l[label.IstioRev] = cfg.Revision
 		} else {
 			l["istio-injection"] = "enabled"
 		}

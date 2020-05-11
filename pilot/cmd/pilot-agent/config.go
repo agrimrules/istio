@@ -33,7 +33,6 @@ import (
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/validation"
-	"istio.io/istio/pkg/kube/inject"
 )
 
 // getTLSCerts returns all file based certificates from mesh config
@@ -75,7 +74,7 @@ func constructProxyConfig() (meshconfig.ProxyConfig, error) {
 		}
 		fileMeshContents = string(contents)
 	}
-	meshConfig, err := getMeshConfig(fileMeshContents, annotations[inject.ProxyConfigAnnotation])
+	meshConfig, err := getMeshConfig(fileMeshContents, annotations[annotation.ProxyConfig.Name])
 	if err != nil {
 		return meshconfig.ProxyConfig{}, err
 	}
@@ -124,17 +123,17 @@ func getMeshConfig(fileOverride, annotationOverride string) (meshconfig.MeshConf
 		mc = *fileMesh
 	}
 
-	if meshConfig != "" {
-		log.Infof("Apply mesh config from env %v", meshConfig)
-		envMesh, err := mesh.ApplyMeshConfig(meshConfig, mc)
+	if proxyConfigEnv != "" {
+		log.Infof("Apply proxy config from env %v", proxyConfigEnv)
+		envMesh, err := mesh.ApplyProxyConfig(proxyConfigEnv, mc)
 		if err != nil || envMesh == nil {
-			return meshconfig.MeshConfig{}, fmt.Errorf("failed to unmarshal mesh config from environment [%v]: %v", meshConfig, err)
+			return meshconfig.MeshConfig{}, fmt.Errorf("failed to unmarshal mesh config from environment [%v]: %v", proxyConfigEnv, err)
 		}
 		mc = *envMesh
 	}
 
 	if annotationOverride != "" {
-		log.Infof("Apply mesh config from annotation %v", annotationOverride)
+		log.Infof("Apply proxy config from annotation %v", annotationOverride)
 		annotationMesh, err := mesh.ApplyProxyConfig(annotationOverride, mc)
 		if err != nil || annotationMesh == nil {
 			return meshconfig.MeshConfig{}, fmt.Errorf("failed to unmarshal mesh config from annotation [%v]: %v", annotationOverride, err)

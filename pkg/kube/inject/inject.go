@@ -36,6 +36,8 @@ import (
 	"github.com/gogo/protobuf/types"
 	"github.com/hashicorp/go-multierror"
 
+	"istio.io/api/label"
+
 	"istio.io/istio/pkg/config/mesh"
 	"istio.io/istio/pkg/config/validation"
 	"istio.io/istio/pkg/util/gogoprotomarshal"
@@ -92,7 +94,7 @@ var (
 		annotation.SidecarTrafficExcludeOutboundPorts.Name:        ValidateExcludeOutboundPorts,
 		annotation.SidecarTrafficKubevirtInterfaces.Name:          alwaysValidFunc,
 		annotation.PrometheusMergeMetrics.Name:                    validateBool,
-		ProxyConfigAnnotation:                                     validateProxyConfig,
+		annotation.ProxyConfig.Name:                               validateProxyConfig,
 	}
 )
 
@@ -438,9 +440,6 @@ func flippedContains(needle, haystack string) bool {
 	return strings.Contains(haystack, needle)
 }
 
-// ProxyConfigAnnotation determines the mesh config overrides for a workloadTODO move this to API
-var ProxyConfigAnnotation = "istio.io/proxyConfig"
-
 // InjectionData renders sidecarTemplate with valuesConfig.
 func InjectionData(sidecarTemplate, valuesConfig, version string, typeMetadata *metav1.TypeMeta, deploymentMetadata *metav1.ObjectMeta, spec *corev1.PodSpec,
 	metadata *metav1.ObjectMeta, meshConfig *meshconfig.MeshConfig) (
@@ -464,7 +463,7 @@ func InjectionData(sidecarTemplate, valuesConfig, version string, typeMetadata *
 		return nil, "", multierror.Prefix(err, "could not parse configuration values:")
 	}
 
-	if pca, f := metadata.GetAnnotations()[ProxyConfigAnnotation]; f {
+	if pca, f := metadata.GetAnnotations()[annotation.ProxyConfig.Name]; f {
 		var merr error
 		meshConfig, merr = mesh.ApplyProxyConfig(pca, *meshConfig)
 		if merr != nil {
@@ -790,9 +789,9 @@ func IntoObject(sidecarTemplate string, valuesConfig string, revision string, me
 	}
 	// This function, IntoObject(), is only used on the 'istioctl kube-kubeinject' path, which
 	// doesn't use Pilot bootstrap variables.
-	metadata.Labels[model.RevisionLabel] = revision
-	if status != "" && metadata.Labels[model.TLSModeLabelName] == "" {
-		metadata.Labels[model.TLSModeLabelName] = model.IstioMutualTLSModeLabel
+	metadata.Labels[label.IstioRev] = revision
+	if status != "" && metadata.Labels[label.TLSMode] == "" {
+		metadata.Labels[label.TLSMode] = model.IstioMutualTLSModeLabel
 	}
 
 	return out, nil
@@ -851,7 +850,7 @@ func structToJSON(v interface{}) string {
 }
 
 func protoToJSON(v proto.Message) string {
-	v = cleanMeshConfig(v)
+	v = cleanProxyConfig(v)
 	if v == nil {
 		return "{}"
 	}
@@ -866,7 +865,15 @@ func protoToJSON(v proto.Message) string {
 	return ba
 }
 
-func cleanProxyConfig(pc meshconfig.ProxyConfig) *meshconfig.ProxyConfig {
+// Rather than dump the entire proxy config, we remove fields that are default
+// This makes the pod spec much smaller
+// This is not comprehensive code, but nothing will break if this misses some fields
+func cleanProxyConfig(msg proto.Message) proto.Message {
+	originalProxyConfig, ok := msg.(*meshconfig.ProxyConfig)
+	if !ok || originalProxyConfig == nil {
+		return msg
+	}
+	pc := *originalProxyConfig
 	defaults := mesh.DefaultProxyConfig()
 	if pc.ConfigPath == defaults.ConfigPath {
 		pc.ConfigPath = ""
@@ -892,6 +899,9 @@ func cleanProxyConfig(pc meshconfig.ProxyConfig) *meshconfig.ProxyConfig {
 	if reflect.DeepEqual(pc.EnvoyAccessLogService, defaults.EnvoyAccessLogService) {
 		pc.EnvoyAccessLogService = nil
 	}
+	if reflect.DeepEqual(pc.Tracing, defaults.Tracing) {
+		pc.Tracing = nil
+	}
 	if pc.ProxyAdminPort == defaults.ProxyAdminPort {
 		pc.ProxyAdminPort = 0
 	}
@@ -901,105 +911,10 @@ func cleanProxyConfig(pc meshconfig.ProxyConfig) *meshconfig.ProxyConfig {
 	if pc.StatusPort == defaults.StatusPort {
 		pc.StatusPort = 0
 	}
-	return &pc
-}
-
-// Rather than dump the entire proxy config, we remove fields that are default
-// This makes the pod spec much smaller
-// This is not comprehensive code, but nothing will break if this misses some fields
-func cleanMeshConfig(v proto.Message) proto.Message {
-	mc, ok := v.(*meshconfig.MeshConfig)
-	if !ok || mc == nil {
-		return v
+	if pc.Concurrency == defaults.Concurrency {
+		pc.Concurrency = 0
 	}
-
-	cpy := *mc
-
-	defaults := mesh.DefaultMeshConfig()
-	if reflect.DeepEqual(cpy.DefaultConfig, defaults.DefaultConfig) {
-		cpy.DefaultConfig = nil
-	} else if cpy.DefaultConfig != nil {
-		cpy.DefaultConfig = cleanProxyConfig(*cpy.DefaultConfig)
-	}
-	if cpy.DisablePolicyChecks == defaults.DisablePolicyChecks {
-		cpy.DisablePolicyChecks = false
-	}
-	if cpy.DisableMixerHttpReports == defaults.DisableMixerHttpReports {
-		cpy.DisableMixerHttpReports = false
-	}
-	if cpy.EnableTracing == defaults.EnableTracing {
-		cpy.EnableTracing = false
-	}
-	if cpy.ProxyListenPort == defaults.ProxyListenPort {
-		cpy.ProxyListenPort = 0
-	}
-	if cpy.ReportBatchMaxEntries == defaults.ReportBatchMaxEntries {
-		cpy.ReportBatchMaxEntries = 0
-	}
-	if reflect.DeepEqual(cpy.ConnectTimeout, defaults.ConnectTimeout) {
-		cpy.ConnectTimeout = nil
-	}
-	if reflect.DeepEqual(cpy.DnsRefreshRate, defaults.DnsRefreshRate) {
-		cpy.DnsRefreshRate = nil
-	}
-	if reflect.DeepEqual(cpy.ProtocolDetectionTimeout, defaults.ProtocolDetectionTimeout) {
-		cpy.ProtocolDetectionTimeout = nil
-	}
-	if reflect.DeepEqual(cpy.DefaultServiceExportTo, defaults.DefaultServiceExportTo) {
-		cpy.DefaultServiceExportTo = nil
-	}
-	if reflect.DeepEqual(cpy.DefaultVirtualServiceExportTo, defaults.DefaultVirtualServiceExportTo) {
-		cpy.DefaultVirtualServiceExportTo = nil
-	}
-	if reflect.DeepEqual(cpy.DefaultDestinationRuleExportTo, defaults.DefaultDestinationRuleExportTo) {
-		cpy.DefaultDestinationRuleExportTo = nil
-	}
-	if reflect.DeepEqual(cpy.EnableAutoMtls, defaults.EnableAutoMtls) {
-		cpy.EnableAutoMtls = nil
-	}
-	if reflect.DeepEqual(cpy.TrustDomainAliases, defaults.TrustDomainAliases) {
-		cpy.TrustDomainAliases = nil
-	}
-	if reflect.DeepEqual(cpy.OutboundTrafficPolicy, defaults.OutboundTrafficPolicy) {
-		cpy.OutboundTrafficPolicy = nil
-	}
-	if reflect.DeepEqual(cpy.Certificates, defaults.Certificates) {
-		cpy.Certificates = nil
-	}
-	if reflect.DeepEqual(cpy.LocalityLbSetting, defaults.LocalityLbSetting) {
-		cpy.LocalityLbSetting = nil
-	}
-	if reflect.DeepEqual(cpy.ReportBatchMaxTime, defaults.ReportBatchMaxTime) {
-		cpy.ReportBatchMaxTime = nil
-	}
-	if reflect.DeepEqual(cpy.ThriftConfig, defaults.ThriftConfig) {
-		cpy.ThriftConfig = nil
-	}
-	if cpy.IngressService == defaults.IngressService {
-		cpy.IngressService = ""
-	}
-	if cpy.IngressClass == defaults.IngressClass {
-		cpy.IngressClass = ""
-	}
-	if cpy.AccessLogFile == defaults.AccessLogFile {
-		cpy.AccessLogFile = ""
-	}
-	if cpy.RootNamespace == defaults.RootNamespace {
-		cpy.RootNamespace = ""
-	}
-	if cpy.TrustDomain == defaults.TrustDomain {
-		cpy.TrustDomain = ""
-	}
-	if cpy.SdsUdsPath == defaults.SdsUdsPath {
-		cpy.SdsUdsPath = ""
-	}
-	if cpy.IngressControllerMode == defaults.IngressControllerMode {
-		cpy.IngressControllerMode = meshconfig.MeshConfig_UNSPECIFIED
-	}
-	if reflect.DeepEqual(cpy.ServiceSettings, defaults.ServiceSettings) {
-		cpy.ServiceSettings = nil
-	}
-	return &cpy
+	return proto.Message(&pc)
 }
 
 func toJSON(m map[string]string) string {

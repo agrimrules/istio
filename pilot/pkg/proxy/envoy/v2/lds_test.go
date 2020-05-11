@@ -21,8 +21,6 @@ import (
 
 	"github.com/golang/protobuf/ptypes"
 
-	"istio.io/istio/pkg/config/mesh"
-
 	v2 "istio.io/istio/pilot/pkg/proxy/envoy/v2"
 	"istio.io/istio/pilot/pkg/serviceregistry"
 
@@ -30,7 +28,6 @@ import (
 	xdsapi_listener "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
 	xdsapi_http_connection_manager "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
 
-	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/util/gogoprotomarshal"
 
@@ -44,9 +41,6 @@ import (
 
 // TestLDS using isolated namespaces
 func TestLDSIsolated(t *testing.T) {
-	defaultInboundValue := features.EnableProtocolSniffingForInbound
-	features.EnableProtocolSniffingForInbound = true
-	defer func() { features.EnableProtocolSniffingForInbound = defaultInboundValue }()
 	_, tearDown := initLocalPilotTestEnv(t)
 	defer tearDown()
 
@@ -454,10 +448,6 @@ func TestLDSWithSidecarForWorkloadWithoutService(t *testing.T) {
 
 // TestLDS using default sidecar in root namespace
 func TestLDSEnvoyFilterWithWorkloadSelector(t *testing.T) {
-	mesh.TestMode = true
-	defaultInboundValue := features.EnableProtocolSniffingForInbound
-	features.EnableProtocolSniffingForInbound = true
-	defer func() { features.EnableProtocolSniffingForInbound = defaultInboundValue }()
 	server, tearDown := util.EnsureTestServer(func(args *bootstrap.PilotArgs) {
 		args.Plugins = bootstrap.DefaultPlugins
 		args.Config.FileDir = env.IstioSrc + "/tests/testdata/networking/envoyfilter-without-service"

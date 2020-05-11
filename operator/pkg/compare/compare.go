@@ -26,7 +26,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"sigs.k8s.io/yaml"
 
-	"istio.io/istio/operator/pkg/manifest"
 	"istio.io/istio/operator/pkg/object"
 	"istio.io/istio/operator/pkg/tpath"
 	"istio.io/istio/operator/pkg/util"
@@ -185,8 +184,8 @@ func genYamlIgnoreOpt(yamlStr string) (cmp.Option, error) {
 	}
 	return cmp.FilterPath(func(curPath cmp.Path) bool {
 		up := pathToStringList(curPath)
-		treeNode, found, _ := tpath.GetFromTreePath(tree, up)
-		return found && tpath.IsLeafNode(treeNode)
+		treeNode, found, _ := tpath.Find(tree, up)
+		return found && IsLeafNode(treeNode)
 	}, cmp.Ignore()), nil
 }
 
@@ -298,7 +297,7 @@ func FilterManifest(ms string, selectResources string, ignoreResources string) (
 	if err != nil {
 		return "", err
 	}
-	k8sObjects.Sort(manifest.DefaultObjectOrder())
+	k8sObjects.Sort(object.DefaultObjectOrder())
 	sortdManifests, err := k8sObjects.YAMLManifest()
 	if err != nil {
 		return "", err
@@ -497,4 +496,9 @@ func writeStringSafe(sb io.StringWriter, s string) {
 	if err != nil {
 		log.Error(err.Error())
 	}
+}
+
+// IsLeafNode reports whether the given node is a leaf, assuming internal nodes can only be maps or slices.
+func IsLeafNode(node interface{}) bool {
+	return !util.IsMap(node) && !util.IsSlice(node)
 }

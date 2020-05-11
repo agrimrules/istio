@@ -27,6 +27,7 @@ import (
 	"istio.io/istio/pilot/pkg/features"
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/networking/core"
+	"istio.io/istio/pilot/pkg/util/sets"
 )
 
 var (
@@ -68,6 +69,10 @@ const (
 	ListenerType = typePrefix + "Listener"
 	// RouteType is sent after listeners.
 	RouteType = typePrefix + "RouteConfiguration"
+
+	// EndpointTypeV3 is used for EDS and ADS endpoint discovery. Typically second request.
+	EndpointTypeV3 = "type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment"
+	ClusterTypeV3  = "type.googleapis.com/envoy.config.cluster.v3.Cluster"
 )
 
 func init() {
@@ -92,6 +97,10 @@ type DiscoveryServer struct {
 	ConfigGenerator core.ConfigGenerator
 
 	// Generators allow customizing the generated config, based on the client metadata.
+	// Key is the generator type - will match the Generator metadata to set the per-connection
+	// default generator, or the combination of Generator metadata and TypeUrl to select a
+	// different generator for a type.
+	// Normal istio clients use the default generator - will not be impacted by this.
 	Generators map[string]model.XdsResourceGenerator
 
 	concurrentPushLimit chan struct{}
@@ -122,6 +131,8 @@ type DiscoveryServer struct {
 	// adsClients reflect active gRPC channels, for both ADS and EDS.
 	adsClients      map[string]*XdsConnection
 	adsClientsMutex sync.RWMutex
+
+	StatusReporter DistributionEventHandler
 }
 
 // EndpointShards holds the set of endpoint shards of a service. Registries update
@@ -141,7 +152,7 @@ type EndpointShards struct {
 	// current list, a full push will be forced, to trigger a secure naming update.
 	// Due to the larger time, it is still possible that connection errors will occur while
 	// CDS is updated.
-	ServiceAccounts map[string]bool
+	ServiceAccounts sets.Set
 }
 
 // NewDiscoveryServer creates DiscoveryServer that sources data from Pilot's internal mesh data structures
